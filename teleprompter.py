@@ -1,23 +1,37 @@
 # -*- coding: utf-8 -*-
 """
-간단 프롬프터(Teleprompter)
-- 글자크기 변경
-- 시스템 폰트 선택 (기본값: 페이퍼로지 고딕, 없으면 자동 대체)
-- 내용 편집
-- 창 크기 자유 조절 / 전체화면
-- 항상 위(상단 고정)
-- 탭으로 여러 원고 구분
-- 원고 내 하이라이트(형광펜/글자색)
-- 행동지시(▶ 로 시작하는 줄)는 원고에서 숨겨지고 오른쪽 패널에 표시,
-  현재 읽고 있는 위치에 맞춰 자동으로 강조됨
-- 자동 스크롤 속도 및 간격(스텝) 조정
+간단 프롬프터 (Teleprompter) v2
+- 라이트/다크 모드
+- 행동지시: "대사 | 지시문" 형태로 같은 줄에 표시 (원고는 사라지지 않음)
+- 자동스크롤: 픽셀 단위 부드러운 스크롤 + 속도 슬라이더
+- 마우스휠 간격: 1줄 / 2줄 / 3줄 중 선택
+- 상단 툴바 2줄 구성 + 접기/펼치기
 """
 
 import tkinter as tk
 from tkinter import ttk, font as tkfont, simpledialog, messagebox
 
 DEFAULT_FONT_CANDIDATES = ["Paperlogy", "PaperlogyGothic", "Paperlogy Gothic", "맑은 고딕", "Malgun Gothic"]
-NOTE_MARK = "▶"
+INSTR_SEP = "|"
+AUTOSCROLL_TICK_MS = 40  # 고정 틱 간격(ms). 속도는 틱당 이동 픽셀 수로 조절.
+
+THEMES = {
+    "light": dict(
+        bg="#f4f4f4", fg="#1a1a1a", toolbar_bg="#e9e9e9",
+        text_bg="#ffffff", text_fg="#1a1a1a", instr_fg="#b5651d",
+        select_bg="#cfe8ff",
+    ),
+    "dark": dict(
+        bg="#1e1e1e", fg="#e8e8e8", toolbar_bg="#262626",
+        text_bg="#121212", text_fg="#f0f0f0", instr_fg="#4fc3f7",
+        select_bg="#3a5772",
+    ),
+}
+
+TEXT_COLOR_SETS = {
+    "light": {"빨강": "#e53935", "파랑": "#1e88e5", "검정": "#000000"},
+    "dark":  {"연두": "#b6ff3c", "노랑": "#ffe14d", "흰색": "#ffffff"},
+}
 
 HILITE_COLORS = {
     "노랑": "#fff59d",
@@ -25,53 +39,28 @@ HILITE_COLORS = {
     "분홍": "#f8bbd0",
     "하늘": "#bbdefb",
 }
-TEXT_COLORS = {
-    "빨강": "#e53935",
-    "파랑": "#1e88e5",
-    "검정": "#000000",
-}
+
+DEFAULT_SCRIPT = (
+    f"안녕하세요 {INSTR_SEP} 꾸벅 화면에 인사하기\n"
+    f"뭐뭐입니다 {INSTR_SEP}\n"
+    f"날씨 참 덥죠? {INSTR_SEP} 손 부채질하기\n"
+    "\n"
+    f"'|' 기호 뒤에 지시문을 쓰면 대사 옆에 색이 다르게 표시됩니다."
+)
 
 
 class TabData:
     def __init__(self, notebook, title):
         self.frame = ttk.Frame(notebook)
         self.title = title
-
-        paned = ttk.Panedwindow(self.frame, orient="horizontal")
-        paned.pack(fill="both", expand=True)
-
-        # ---- 원고 텍스트 ----
-        left = ttk.Frame(paned)
         self.text = tk.Text(
-            left, wrap="word", undo=True, spacing1=6, spacing3=6,
-            padx=16, pady=16, borderwidth=0
+            self.frame, wrap="word", undo=True, spacing1=6, spacing3=6,
+            padx=18, pady=16, borderwidth=0, highlightthickness=0
         )
-        yscroll = ttk.Scrollbar(left, orient="vertical", command=self.text.yview)
+        yscroll = ttk.Scrollbar(self.frame, orient="vertical", command=self.text.yview)
         self.text.configure(yscrollcommand=yscroll.set)
         self.text.pack(side="left", fill="both", expand=True)
         yscroll.pack(side="right", fill="y")
-        paned.add(left, weight=4)
-
-        # ---- 행동지시 패널 ----
-        right = ttk.Frame(paned)
-        ttk.Label(right, text="행동지시", anchor="center",
-                  font=("", 10, "bold")).pack(fill="x", pady=(4, 2))
-        self.note_list = tk.Listbox(right, activestyle="none", exportselection=False)
-        self.note_list.pack(fill="both", expand=True, padx=4, pady=4)
-        paned.add(right, weight=1)
-
-        # 태그: 행동지시 줄은 원고에서 숨김(elide)
-        self.text.tag_configure("action", elide=True)
-        self.notes = []  # [(line_no, note_text)]
-
-        self.note_list.bind("<<ListboxSelect>>", self._jump_to_note)
-
-    def _jump_to_note(self, _evt=None):
-        sel = self.note_list.curselection()
-        if not sel:
-            return
-        line_no, _ = self.notes[sel[0]]
-        self.text.see(f"{line_no}.0")
 
 
 class PrompterApp:
@@ -80,88 +69,128 @@ class PrompterApp:
         self.root.title("간단 프롬프터")
         self.root.geometry("1100x700")
 
+        self.theme_name = tk.StringVar(value="light")
         self.autoscroll_on = False
+        self._scroll_accum = 0.0
         self.tabs = []
         self.tab_counter = 0
+        self.toolbar_expanded = tk.BooleanVar(value=True)
 
-        self._build_toolbar()
+        self._build_toolbar_shell()
+        self._build_toolbar_rows()
         self._build_notebook()
         self.add_tab()
+        self._apply_theme()
 
         self.root.bind("<F11>", self._toggle_fullscreen)
         self.root.bind("<Escape>", lambda e: self.root.attributes("-fullscreen", False))
         self.root.bind("<Up>", lambda e: self._manual_scroll(-1))
         self.root.bind("<Down>", lambda e: self._manual_scroll(1))
 
-    # ---------------------------------------------------------- 툴바
-    def _build_toolbar(self):
-        bar = ttk.Frame(self.root, padding=6)
-        bar.pack(side="top", fill="x")
+    # ---------------------------------------------------------- 툴바 뼈대(접기/펼치기)
+    def _build_toolbar_shell(self):
+        self.shell = ttk.Frame(self.root, padding=(6, 4))
+        self.shell.pack(side="top", fill="x")
 
-        # 폰트
-        ttk.Label(bar, text="폰트:").pack(side="left")
+        header = ttk.Frame(self.shell)
+        header.pack(side="top", fill="x")
+        ttk.Label(header, text="메뉴", font=("", 9, "bold")).pack(side="left")
+        self.toggle_btn = ttk.Button(header, text="▲ 접기", width=10, command=self._toggle_toolbar)
+        self.toggle_btn.pack(side="right")
+
+        self.controls = ttk.Frame(self.shell)
+        self.controls.pack(side="top", fill="x", pady=(4, 0))
+
+    def _toggle_toolbar(self):
+        expanded = not self.toolbar_expanded.get()
+        self.toolbar_expanded.set(expanded)
+        if expanded:
+            self.controls.pack(side="top", fill="x", pady=(4, 0))
+            self.toggle_btn.configure(text="▲ 접기")
+        else:
+            self.controls.pack_forget()
+            self.toggle_btn.configure(text="▼ 펼치기")
+
+    # ---------------------------------------------------------- 툴바 내용 (2줄)
+    def _build_toolbar_rows(self):
+        row1 = ttk.Frame(self.controls)
+        row1.pack(side="top", fill="x", pady=2)
+        row2 = ttk.Frame(self.controls)
+        row2.pack(side="top", fill="x", pady=2)
+
+        # ---- Row1 : 테마 / 폰트 / 창 / 탭 ----
+        ttk.Label(row1, text="테마:").pack(side="left")
+        ttk.Button(row1, text="라이트", width=6,
+                   command=lambda: self._set_theme("light")).pack(side="left", padx=1)
+        ttk.Button(row1, text="다크", width=6,
+                   command=lambda: self._set_theme("dark")).pack(side="left", padx=(1, 10))
+
+        ttk.Label(row1, text="폰트:").pack(side="left")
         families = sorted(tkfont.families())
         default_family = next((f for f in DEFAULT_FONT_CANDIDATES if f in families), families[0])
         self.font_family = tk.StringVar(value=default_family)
-        fam_box = ttk.Combobox(bar, textvariable=self.font_family, values=families,
-                                width=18, state="readonly")
+        fam_box = ttk.Combobox(row1, textvariable=self.font_family, values=families,
+                                width=16, state="readonly")
         fam_box.pack(side="left", padx=(2, 10))
         fam_box.bind("<<ComboboxSelected>>", lambda e: self._apply_font())
 
-        # 글자크기
-        ttk.Label(bar, text="크기:").pack(side="left")
+        ttk.Label(row1, text="크기:").pack(side="left")
         self.font_size = tk.IntVar(value=32)
-        size_spin = ttk.Spinbox(bar, from_=8, to=200, width=5, textvariable=self.font_size,
+        size_spin = ttk.Spinbox(row1, from_=8, to=200, width=5, textvariable=self.font_size,
                                  command=self._apply_font)
         size_spin.pack(side="left", padx=(2, 10))
         size_spin.bind("<Return>", lambda e: self._apply_font())
 
-        # 상단 고정
         self.topmost = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="항상 위", variable=self.topmost,
+        ttk.Checkbutton(row1, text="항상 위", variable=self.topmost,
                          command=self._apply_topmost).pack(side="left", padx=(0, 10))
 
-        # 전체화면
-        ttk.Button(bar, text="전체화면(F11)", command=self._toggle_fullscreen).pack(side="left", padx=(0, 10))
+        ttk.Button(row1, text="전체화면(F11)", command=self._toggle_fullscreen).pack(side="left", padx=(0, 10))
 
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Separator(row1, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Button(row1, text="+ 탭", width=6, command=self.add_tab).pack(side="left", padx=1)
+        ttk.Button(row1, text="탭 이름변경", command=self.rename_tab).pack(side="left", padx=1)
+        ttk.Button(row1, text="탭 닫기", command=self.close_tab).pack(side="left", padx=1)
 
-        # 하이라이트 (배경색)
-        ttk.Label(bar, text="하이라이트:").pack(side="left")
-        for name, color in HILITE_COLORS.items():
-            b = tk.Button(bar, text="  ", bg=color, width=2,
-                          command=lambda c=color: self._apply_highlight(bg=c))
-            b.pack(side="left", padx=1)
+        # ---- Row2 : 하이라이트 / 글자색 / 자동스크롤 / 휠간격 ----
+        ttk.Label(row2, text="하이라이트:").pack(side="left")
+        for color in HILITE_COLORS.values():
+            tk.Button(row2, text="  ", bg=color, width=2, relief="raised",
+                      command=lambda c=color: self._apply_highlight(bg=c)).pack(side="left", padx=1)
 
-        # 글자색
-        ttk.Label(bar, text=" 글자색:").pack(side="left")
-        for name, color in TEXT_COLORS.items():
-            b = tk.Button(bar, text="  ", bg=color, width=2,
-                          command=lambda c=color: self._apply_highlight(fg=c))
-            b.pack(side="left", padx=1)
+        ttk.Label(row2, text=" 글자색:").pack(side="left")
+        self.text_color_frame = ttk.Frame(row2)
+        self.text_color_frame.pack(side="left")
+        self._build_text_color_buttons()
 
-        ttk.Button(bar, text="서식지우기", command=self._clear_format).pack(side="left", padx=(6, 10))
+        ttk.Button(row2, text="서식지우기", command=self._clear_format).pack(side="left", padx=(6, 10))
 
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Separator(row2, orient="vertical").pack(side="left", fill="y", padx=6)
 
-        # 자동 스크롤
-        self.scroll_btn = ttk.Button(bar, text="▶ 자동스크롤", command=self._toggle_autoscroll)
+        self.scroll_btn = ttk.Button(row2, text="▶ 자동스크롤", command=self._toggle_autoscroll)
         self.scroll_btn.pack(side="left", padx=(0, 6))
 
-        ttk.Label(bar, text="속도:").pack(side="left")
-        self.scroll_speed = tk.IntVar(value=50)  # ms 간격, 작을수록 빠름
-        ttk.Scale(bar, from_=10, to=300, orient="horizontal", length=100,
-                  variable=self.scroll_speed).pack(side="left", padx=(2, 10))
+        ttk.Label(row2, text="속도:").pack(side="left")
+        self.scroll_speed = tk.DoubleVar(value=1.2)
+        speed_scale = tk.Scale(row2, from_=0.2, to=6.0, resolution=0.1, orient="horizontal",
+                                length=110, showvalue=False, variable=self.scroll_speed)
+        speed_scale.pack(side="left", padx=(2, 10))
 
-        ttk.Label(bar, text="간격(줄):").pack(side="left")
-        self.scroll_step = tk.IntVar(value=1)
-        ttk.Spinbox(bar, from_=1, to=10, width=4, textvariable=self.scroll_step).pack(side="left", padx=(2, 10))
+        ttk.Separator(row2, orient="vertical").pack(side="left", fill="y", padx=6)
 
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Label(row2, text="휠 간격:").pack(side="left")
+        self.wheel_step = tk.IntVar(value=1)
+        for val, label in [(1, "1줄"), (2, "2줄"), (3, "3줄")]:
+            tk.Radiobutton(row2, text=label, value=val, variable=self.wheel_step,
+                           indicatoron=False, width=5).pack(side="left", padx=1)
 
-        ttk.Button(bar, text="+ 탭 추가", command=self.add_tab).pack(side="left", padx=2)
-        ttk.Button(bar, text="탭 이름변경", command=self.rename_tab).pack(side="left", padx=2)
-        ttk.Button(bar, text="탭 닫기", command=self.close_tab).pack(side="left", padx=2)
+    def _build_text_color_buttons(self):
+        for w in self.text_color_frame.winfo_children():
+            w.destroy()
+        colors = TEXT_COLOR_SETS[self.theme_name.get()]
+        for color in colors.values():
+            tk.Button(self.text_color_frame, text="  ", bg=color, width=2, relief="raised",
+                      command=lambda c=color: self._apply_highlight(fg=c)).pack(side="left", padx=1)
 
     # ---------------------------------------------------------- 노트북(탭)
     def _build_notebook(self):
@@ -177,15 +206,14 @@ class PrompterApp:
         self.notebook.select(data.frame)
         self.tabs.append(data)
 
-        data.text.insert("1.0", "여기에 원고 내용을 입력하세요.\n"
-                                 f"{NOTE_MARK} 이 줄처럼 맨 앞에 '{NOTE_MARK}'를 붙이면 행동지시로 처리되어 "
-                                 "원고에는 보이지 않고 오른쪽 패널에 표시됩니다.\n"
-                                 "다음 대사를 이어서 입력하세요.")
-        data.text.bind("<KeyRelease>", lambda e, d=data: self._refresh_notes(d))
-        data.text.bind("<MouseWheel>", lambda e, d=data: self.root.after(10, self._refresh_note_highlight, d))
-        data.text.bind("<ButtonRelease-1>", lambda e, d=data: self._refresh_note_highlight(d))
+        data.text.insert("1.0", DEFAULT_SCRIPT)
+        data.text.bind("<KeyRelease>", lambda e, d=data: self._refresh_instructions(d))
+        data.text.bind("<MouseWheel>", self._on_mousewheel)      # Windows/Mac
+        data.text.bind("<Button-4>", self._on_mousewheel_linux)  # Linux
+        data.text.bind("<Button-5>", self._on_mousewheel_linux)
         self._apply_font()
-        self._refresh_notes(data)
+        self._apply_theme_to_tab(data)
+        self._refresh_instructions(data)
 
     def rename_tab(self):
         data = self._current_tab()
@@ -216,8 +244,10 @@ class PrompterApp:
     # ---------------------------------------------------------- 폰트/창
     def _apply_font(self):
         f = (self.font_family.get(), self.font_size.get())
+        instr_f = (self.font_family.get(), max(8, int(self.font_size.get() * 0.72)), "italic")
         for d in self.tabs:
             d.text.configure(font=f)
+            d.text.tag_configure("instr", font=instr_f)
 
     def _apply_topmost(self):
         self.root.attributes("-topmost", self.topmost.get())
@@ -226,14 +256,50 @@ class PrompterApp:
         cur = self.root.attributes("-fullscreen")
         self.root.attributes("-fullscreen", not cur)
 
+    # ---------------------------------------------------------- 테마
+    def _set_theme(self, name):
+        self.theme_name.set(name)
+        self._apply_theme()
+
+    def _apply_theme(self):
+        t = THEMES[self.theme_name.get()]
+        self.root.configure(bg=t["bg"])
+        self.shell.configure(style="Toolbar.TFrame")
+        self.controls.configure(style="Toolbar.TFrame")
+
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("Toolbar.TFrame", background=t["toolbar_bg"])
+        style.configure("TFrame", background=t["toolbar_bg"])
+        style.configure("TLabel", background=t["toolbar_bg"], foreground=t["fg"])
+        style.configure("TCheckbutton", background=t["toolbar_bg"], foreground=t["fg"])
+        style.configure("TButton", background=t["bg"], foreground=t["fg"])
+        style.map("TButton", background=[("active", t["select_bg"])])
+
+        for d in self.tabs:
+            self._apply_theme_to_tab(d)
+
+        self._build_text_color_buttons()
+
+    def _apply_theme_to_tab(self, data: TabData):
+        t = THEMES[self.theme_name.get()]
+        data.text.configure(
+            bg=t["text_bg"], fg=t["text_fg"],
+            insertbackground=t["text_fg"],
+            selectbackground=t["select_bg"],
+        )
+        data.text.tag_configure("instr", foreground=t["instr_fg"])
+
     # ---------------------------------------------------------- 하이라이트
     def _apply_highlight(self, bg=None, fg=None):
         data = self._current_tab()
         if not data:
             return
         try:
-            sel_range = data.text.tag_ranges("sel")
-            if not sel_range:
+            if not data.text.tag_ranges("sel"):
                 return
             tag_name = f"fmt_{bg}_{fg}"
             opts = {}
@@ -243,6 +309,7 @@ class PrompterApp:
                 opts["foreground"] = fg
             data.text.tag_configure(tag_name, **opts)
             data.text.tag_add(tag_name, "sel.first", "sel.last")
+            data.text.tag_raise(tag_name)
         except tk.TclError:
             pass
 
@@ -251,61 +318,57 @@ class PrompterApp:
         if not data:
             return
         try:
+            if not data.text.tag_ranges("sel"):
+                return
             for tag in data.text.tag_names():
                 if tag.startswith("fmt_"):
                     data.text.tag_remove(tag, "sel.first", "sel.last")
         except tk.TclError:
             pass
 
-    # ---------------------------------------------------------- 행동지시
-    def _refresh_notes(self, data: TabData):
+    # ---------------------------------------------------------- 행동지시 (같은 줄 표시)
+    def _refresh_instructions(self, data: TabData):
         text = data.text
-        for tag in ("action",):
-            text.tag_remove(tag, "1.0", "end")
-
-        data.notes.clear()
-        data.note_list.delete(0, "end")
-
+        text.tag_remove("instr", "1.0", "end")
         content = text.get("1.0", "end-1c")
-        lines = content.split("\n")
-        for i, line in enumerate(lines, start=1):
-            if line.strip().startswith(NOTE_MARK):
-                text.tag_add("action", f"{i}.0", f"{i}.end+1c")
-                note_text = line.strip().lstrip(NOTE_MARK).strip()
-                data.notes.append((i, note_text))
-                data.note_list.insert("end", f"[{i}] {note_text}")
-
-        self._refresh_note_highlight(data)
-
-    def _refresh_note_highlight(self, data: TabData):
-        if not data.notes:
-            return
-        try:
-            top_index = data.text.index("@0,0")
-            top_line = int(top_index.split(".")[0])
-        except tk.TclError:
-            return
-        current = 0
-        for i, (line_no, _) in enumerate(data.notes):
-            if line_no <= top_line:
-                current = i
-        data.note_list.selection_clear(0, "end")
-        data.note_list.selection_set(current)
-        data.note_list.see(current)
+        for i, line in enumerate(content.split("\n"), start=1):
+            idx = line.find(INSTR_SEP)
+            if idx >= 0:
+                text.tag_add("instr", f"{i}.{idx}", f"{i}.end")
+        t = THEMES[self.theme_name.get()]
+        text.tag_configure("instr", foreground=t["instr_fg"])
 
     # ---------------------------------------------------------- 스크롤
+    def _on_mousewheel(self, event):
+        data = self._current_tab()
+        if not data:
+            return "break"
+        step = self.wheel_step.get()
+        direction = -1 if event.delta > 0 else 1
+        data.text.yview_scroll(direction * step, "units")
+        return "break"
+
+    def _on_mousewheel_linux(self, event):
+        data = self._current_tab()
+        if not data:
+            return "break"
+        step = self.wheel_step.get()
+        direction = -1 if event.num == 4 else 1
+        data.text.yview_scroll(direction * step, "units")
+        return "break"
+
     def _manual_scroll(self, direction):
         data = self._current_tab()
         if not data:
             return
-        step = self.scroll_step.get()
+        step = self.wheel_step.get()
         data.text.yview_scroll(direction * step, "units")
-        self._refresh_note_highlight(data)
 
     def _toggle_autoscroll(self):
         self.autoscroll_on = not self.autoscroll_on
         self.scroll_btn.configure(text="⏸ 정지" if self.autoscroll_on else "▶ 자동스크롤")
         if self.autoscroll_on:
+            self._scroll_accum = 0.0
             self._autoscroll_tick()
 
     def _autoscroll_tick(self):
@@ -313,18 +376,22 @@ class PrompterApp:
             return
         data = self._current_tab()
         if data:
-            data.text.yview_scroll(self.scroll_step.get(), "units")
-            self._refresh_note_highlight(data)
-        self.root.after(self.scroll_speed.get(), self._autoscroll_tick)
+            self._scroll_accum += self.scroll_speed.get()
+            move = int(self._scroll_accum)
+            if move >= 1:
+                data.text.yview_scroll(move, "pixels")
+                self._scroll_accum -= move
+            # 끝까지 도달하면 자동 정지
+            first, last = data.text.yview()
+            if last >= 0.999:
+                self.autoscroll_on = False
+                self.scroll_btn.configure(text="▶ 자동스크롤")
+                return
+        self.root.after(AUTOSCROLL_TICK_MS, self._autoscroll_tick)
 
 
 def main():
     root = tk.Tk()
-    try:
-        style = ttk.Style()
-        style.theme_use("clam")
-    except tk.TclError:
-        pass
     app = PrompterApp(root)
     root.mainloop()
 
